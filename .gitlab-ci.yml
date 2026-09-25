@@ -1,0 +1,380 @@
+# ==============================================================================
+# SPEC:INPUTS
+# Stessa logica del file Cypress: un input configurabile dalla UI "New pipeline"
+# per lanciare UN SOLO file di test (jobTest_singolo_spec) senza girare tutta
+# la suite. Default = lo unico spec "libero" fuori da una cartella di modulo.
+# ==============================================================================
+spec:
+  inputs:
+    spec_path:
+      default: 'tests/test_login_reale.py'
+      description: 'Path del file di test Playwright/pytest da eseguire nel job jobTest_singolo_spec'
+---
+
+# ==============================================================================
+# IMMAGINE DOCKER
+# Immagine ufficiale Playwright per Python: contiene gia' Chromium/Firefox/WebKit
+# e tutte le dipendenze di sistema dei browser pre-installate, cosi' il job non
+# deve scaricarle ogni volta (stesso ruolo di "cypress/browsers:..." nell'altra
+# pipeline). Il TAG deve combaciare con la versione "playwright==" dichiarata in
+# requirements.txt, altrimenti Playwright non trova i binari giusti dei browser.
+#
+# ATTENZIONE VERSIONE: requirements.txt fissa playwright==1.62.0, ma al momento
+# in cui scrivo questo file l'immagine mcr.microsoft.com/playwright/python NON
+# pubblica ancora un tag v1.62.0 (bug noto lato Microsoft, immagine mancante).
+# Se il pull del tag sotto fallisce, controlla i tag disponibili qui:
+# https://mcr.microsoft.com/en-us/artifact/mar/playwright/python/tags
+# e allinea requirements.txt ALLA versione dell'immagine (o viceversa).
+# ==============================================================================
+image: mcr.microsoft.com/playwright/python:v1.61.0-noble
+
+# ==============================================================================
+# WORKFLOW — identico, per motivazione, a quello della pipeline Cypress: evita
+# la doppia pipeline (push + merge_request_event) sullo stesso commit quando
+# il branch ha gia' una MR aperta collegata.
+# ==============================================================================
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_OPEN_MERGE_REQUESTS'
+      when: never
+    - when: always
+
+# ==============================================================================
+# VARIABLES
+# BASE_URL non e' un segreto (e' solo l'indirizzo dell'ambiente di test), quindi
+# puo' stare qui in chiaro come per CYPRESS_BASE_URL nell'altra pipeline.
+# EMAIL, PASSWORD e TENANT_LABEL sono invece credenziali reali (vengono lette
+# da support/config.py via os.getenv/python-dotenv) e NON vanno mai scritte in
+# questo file: vanno create come CI/CD Variables del progetto GitLab
+# (Settings > CI/CD > Variables), spuntando "Protect variable" e "Mask
+# variable". python-dotenv non le sovrascrive: se non trova un file .env le
+# legge comunque dal vero ambiente, quindi le variabili CI arrivano intatte
+# a support/config.py senza dover committare nessun .env.
+# PIP_CACHE_DIR: dice a pip dove scaricare i pacchetti, DENTRO la cartella del
+# progetto cosi la cache di GitLab (vedi sotto) puo' salvarla (esattamente
+# come CYPRESS_CACHE_FOLDER nell'altra pipeline).
+# ==============================================================================
+variables:
+  BASE_URL: 'https://admin.example.com/'
+  PIP_CACHE_DIR: '$CI_PROJECT_DIR/.cache/pip'
+
+stages:
+  - install
+  - smoke
+  - test
+
+# ==============================================================================
+# CACHE GLOBALE
+# Come nell'altra pipeline: legata al branch, condivisa da tutti i job che non
+# la sovrascrivono. Qui salviamo la cache di pip (i pacchetti gia' scaricati),
+# non i browser: quelli sono gia' dentro l'immagine Docker e non vanno
+# ri-scaricati ad ogni job.
+# ==============================================================================
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - .cache/pip/
+
+# ==============================================================================
+# JOB 1 — INSTALLAZIONE DIPENDENZE
+# Scarica le dipendenze Python e le scrive in cache (policy: push). I job
+# successivi la leggeranno soltanto (policy: pull), senza reinstallare nulla.
+# Non serve "playwright install": i browser sono gia' nell'immagine Docker e
+# la versione del pacchetto Python combacia con quella dell'immagine (vedi
+# nota sul tag piu' in alto).
+# ==============================================================================
+jobInstalla_dipendenze:
+  stage: install
+  tags:
+    - docker
+  script:
+    - pip install -r requirements.txt
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .cache/pip/
+    policy: push
+
+# ==============================================================================
+# JOB 2 — SMOKE TEST
+# Stessa funzione di job_smoke nella pipeline Cypress: verifica che l'app sia
+# raggiungibile PRIMA di lanciare tutta la suite Playwright, solo su main.
+# GIT_STRATEGY: none perche' fa solo curl verso URL esterni, non tocca il repo.
+# ==============================================================================
+job_smoke:
+  stage: smoke
+  image: alpine:latest
+  variables:
+    GIT_STRATEGY: none
+  tags:
+    - docker
+  rules:
+    - if: '$CI_COMMIT_REF_NAME == $CI_DEFAULT_BRANCH'
+  script:
+    - apk add --no-cache curl
+    - echo "Verifico raggiungibilita app..."
+    - curl --fail --max-time 30 "$BASE_URL" | tee smoke_log.txt
+    - echo "Ambiente OK, procedo con i test."
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - smoke_log.txt
+
+# ==============================================================================
+# TEMPLATE NASCOSTO PER I JOB DI TEST
+# Ogni job figlio esegue pytest su UNA sola cartella/modulo di tests/, cosi se
+# un modulo fallisce si capisce subito quale senza scorrere un report unico
+# che mischia tutto. needs: in catena sequenziale come nell'altra pipeline,
+# per non far girare piu' istanze Chromium in parallelo sullo stesso runner.
+# --browser chromium: forza Chromium (equivalente di --browser chrome in
+# Cypress). --screenshot/--video/--tracing "retain-on-failure": pytest-playwright
+# salva screenshot/video/trace SOLO per i test falliti, dentro test-results/.
+# || true: come nell'altra pipeline, evita che un test fallito interrompa lo
+# script prima che i report (junit/html/allure) vengano scritti.
+# dependencies: [] — non serve nessun artifact degli stage precedenti (install,
+# smoke), solo codice + cache pip.
+# ==============================================================================
+.test_job_base:
+  stage: test
+  tags:
+    - docker
+  dependencies: []
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .cache/pip/
+    policy: pull
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - reports/
+      - test-results/
+
+# ------------------------------------------------------------------------------
+# Modulo 0 — Stabilita' moduli (ex-spec Cypress con bug noto, migrati qui).
+# ------------------------------------------------------------------------------
+jobTest_stabilita_moduli:
+  extends: .test_job_base
+  script:
+    - >
+      pytest tests/0_stabilita_moduli_cypress --browser chromium
+      --screenshot=only-on-failure --video=retain-on-failure --tracing=retain-on-failure
+      --junitxml=reports/junit/results_stabilita_moduli.xml
+      --html=reports/html/results_stabilita_moduli.html --self-contained-html
+      --alluredir=reports/allure-results || true
+  artifacts:
+    reports:
+      junit: reports/junit/results_stabilita_moduli.xml
+
+# ------------------------------------------------------------------------------
+# Modulo 1 — Gestione catene.
+# ------------------------------------------------------------------------------
+jobTest_gestione_catene:
+  extends: .test_job_base
+  needs:
+    - jobTest_stabilita_moduli
+  script:
+    - >
+      pytest tests/1_gestione_catene --browser chromium
+      --screenshot=only-on-failure --video=retain-on-failure --tracing=retain-on-failure
+      --junitxml=reports/junit/results_gestione_catene.xml
+      --html=reports/html/results_gestione_catene.html --self-contained-html
+      --alluredir=reports/allure-results || true
+  artifacts:
+    reports:
+      junit: reports/junit/results_gestione_catene.xml
+
+# ------------------------------------------------------------------------------
+# Modulo 2 — Nuovi moduli locale (campi personalizzati, specializzazioni).
+# ------------------------------------------------------------------------------
+jobTest_locale_nuovi_moduli:
+  extends: .test_job_base
+  needs:
+    - jobTest_gestione_catene
+  script:
+    - >
+      pytest tests/2_gestione_locale_nuovi_moduli --browser chromium
+      --screenshot=only-on-failure --video=retain-on-failure --tracing=retain-on-failure
+      --junitxml=reports/junit/results_locale_nuovi_moduli.xml
+      --html=reports/html/results_locale_nuovi_moduli.html --self-contained-html
+      --alluredir=reports/allure-results || true
+  artifacts:
+    reports:
+      junit: reports/junit/results_locale_nuovi_moduli.xml
+
+# ------------------------------------------------------------------------------
+# Modulo 3 — Configurazione ristorante / web app asporto.
+# ------------------------------------------------------------------------------
+jobTest_config_webapp:
+  extends: .test_job_base
+  needs:
+    - jobTest_locale_nuovi_moduli
+  script:
+    - >
+      pytest tests/3_configurazione_ristorante_mod_webapp --browser chromium
+      --screenshot=only-on-failure --video=retain-on-failure --tracing=retain-on-failure
+      --junitxml=reports/junit/results_config_webapp.xml
+      --html=reports/html/results_config_webapp.html --self-contained-html
+      --alluredir=reports/allure-results || true
+  artifacts:
+    reports:
+      junit: reports/junit/results_config_webapp.xml
+
+# ------------------------------------------------------------------------------
+# Modulo 4 — Email marketing.
+# ------------------------------------------------------------------------------
+jobTest_email_marketing:
+  extends: .test_job_base
+  needs:
+    - jobTest_config_webapp
+  script:
+    - >
+      pytest tests/4_email_marketing --browser chromium
+      --screenshot=only-on-failure --video=retain-on-failure --tracing=retain-on-failure
+      --junitxml=reports/junit/results_email_marketing.xml
+      --html=reports/html/results_email_marketing.html --self-contained-html
+      --alluredir=reports/allure-results || true
+  artifacts:
+    reports:
+      junit: reports/junit/results_email_marketing.xml
+
+# ------------------------------------------------------------------------------
+# Modulo 5 — Delivery (Glovo, Deliveroo, Uber Eats, Just Eat, Deliverect).
+# ------------------------------------------------------------------------------
+jobTest_delivery:
+  extends: .test_job_base
+  needs:
+    - jobTest_email_marketing
+  script:
+    - >
+      pytest tests/5_delivery --browser chromium
+      --screenshot=only-on-failure --video=retain-on-failure --tracing=retain-on-failure
+      --junitxml=reports/junit/results_delivery.xml
+      --html=reports/html/results_delivery.html --self-contained-html
+      --alluredir=reports/allure-results || true
+  artifacts:
+    reports:
+      junit: reports/junit/results_delivery.xml
+
+# ------------------------------------------------------------------------------
+# Modulo 6 — Fidelity (carte, coupon, campagne, premi, livelli/tier).
+# ------------------------------------------------------------------------------
+jobTest_fidelity:
+  extends: .test_job_base
+  needs:
+    - jobTest_delivery
+  script:
+    - >
+      pytest tests/6_fidelity --browser chromium
+      --screenshot=only-on-failure --video=retain-on-failure --tracing=retain-on-failure
+      --junitxml=reports/junit/results_fidelity.xml
+      --html=reports/html/results_fidelity.html --self-contained-html
+      --alluredir=reports/allure-results || true
+  artifacts:
+    reports:
+      junit: reports/junit/results_fidelity.xml
+
+# ------------------------------------------------------------------------------
+# Modulo 7 — Report e analytics.
+# ------------------------------------------------------------------------------
+jobTest_report_analytics:
+  extends: .test_job_base
+  needs:
+    - jobTest_fidelity
+  script:
+    - >
+      pytest tests/7_report_e_analytics --browser chromium
+      --screenshot=only-on-failure --video=retain-on-failure --tracing=retain-on-failure
+      --junitxml=reports/junit/results_report_analytics.xml
+      --html=reports/html/results_report_analytics.html --self-contained-html
+      --alluredir=reports/allure-results || true
+  artifacts:
+    reports:
+      junit: reports/junit/results_report_analytics.xml
+
+# ------------------------------------------------------------------------------
+# Modulo 8 — Controllo di gestione (food cost, sprechi, menu engineering).
+# Ultimo della catena.
+# ------------------------------------------------------------------------------
+jobTest_controllo_gestione:
+  extends: .test_job_base
+  needs:
+    - jobTest_report_analytics
+  script:
+    - >
+      pytest tests/8_controllo_gestione --browser chromium
+      --screenshot=only-on-failure --video=retain-on-failure --tracing=retain-on-failure
+      --junitxml=reports/junit/results_controllo_gestione.xml
+      --html=reports/html/results_controllo_gestione.html --self-contained-html
+      --alluredir=reports/allure-results || true
+  artifacts:
+    reports:
+      junit: reports/junit/results_controllo_gestione.xml
+
+# ==============================================================================
+# JOB — TEST SINGOLO SPEC (MANUALE)
+# Stessa logica di jobTest_singolo_spec nella pipeline Cypress: gira solo se
+# lanciato a mano dalla UI, per verificare in isolamento un singolo file senza
+# aspettare tutta la catena. $[[ inputs.spec_path ]] viene sostituito PRIMA
+# che la pipeline parta (interpolazione degli input dichiarati in cima al file).
+# needs: [] — esce dall'ordinamento sequenziale degli stage: appena la cache
+# pip e' disponibile puo' partire subito, senza aspettare smoke.
+# ==============================================================================
+jobTest_singolo_spec:
+  stage: test
+  tags:
+    - docker
+  when: manual
+  needs: []
+  dependencies: []
+  cache:
+    key: ${CI_COMMIT_REF_SLUG}
+    paths:
+      - .cache/pip/
+    policy: pull
+  script:
+    - echo "Eseguo solo lo spec => $[[ inputs.spec_path ]]"
+    - >
+      pytest "$[[ inputs.spec_path ]]" --browser chromium
+      --screenshot=only-on-failure --video=retain-on-failure --tracing=retain-on-failure
+      --junitxml=reports/junit/results_singolo_spec.xml
+      --html=reports/html/results_singolo_spec.html --self-contained-html
+      --alluredir=reports/allure-results
+  artifacts:
+    when: always
+    expire_in: 7 days
+    reports:
+      junit: reports/junit/results_singolo_spec.xml
+    paths:
+      - reports/
+      - test-results/
+
+# ==============================================================================
+# JOB — COMMENTO AUTOMATICO SULLA MERGE REQUEST
+# Identico, per struttura e motivazione, a job_commento_mr della pipeline
+# Cypress: gira solo nel contesto di una MR, dopo l'ultimo job della catena di
+# test, e lascia un commento che rimanda alla tab Tests/agli artifact.
+# GITLAB_BOT_TOKEN va creato come CI/CD Variable protetta (Project Access
+# Token con permesso di scrittura sulle note delle MR), passato nell'header
+# PRIVATE-TOKEN (CI_JOB_TOKEN da solo non basta per questa chiamata API).
+# ==============================================================================
+job_commento_mr:
+  stage: test
+  tags:
+    - docker
+  image: alpine:latest
+  variables:
+    GIT_STRATEGY: none
+  needs:
+    - jobTest_controllo_gestione
+  rules:
+    - if: '$CI_MERGE_REQUEST_IID'
+  script:
+    - apk add --no-cache curl
+    - >
+      curl --request POST
+      --header "PRIVATE-TOKEN: $GITLAB_BOT_TOKEN"
+      --form "body=Pipeline Playwright terminata. Controlla la tab Tests e gli artifact dei job jobTest_* per il dettaglio dei fallimenti per modulo."
+      "https://gitlab.com/api/v4/projects/$CI_PROJECT_ID/merge_requests/$CI_MERGE_REQUEST_IID/notes"
